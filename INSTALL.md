@@ -12,6 +12,7 @@ install or use it.
    with Ark and extract it.
 3. In the extracted folder, right-click **`frame-comfort`** and choose
    **Add to Steam**. It appears in your library as **frame-comfort**.
+   Keep this folder: the Steam shortcut runs from it.
 
 ## Use
 
