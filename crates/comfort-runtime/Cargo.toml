@@ -2,6 +2,7 @@
 name = "comfort-runtime"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 version.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

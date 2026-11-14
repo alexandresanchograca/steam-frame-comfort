@@ -67,5 +67,5 @@ new version is out, the panel offers an **UPDATE** button.
 
 Tested on SteamOS 0.4.5 with SteamVR 2.18.2.
 
-The OpenVR SDK header in this repository is under its own
-[licence](OPENVR-LICENSE.txt).
+Frame Comfort is released under the [MIT licence](LICENSE). The OpenVR SDK
+header in this repository is under its own [licence](OPENVR-LICENSE.txt).

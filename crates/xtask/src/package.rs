@@ -57,6 +57,10 @@ pub fn package(artifacts: &Path, output: &Path) -> io::Result<()> {
     fs::set_permissions(&launcher, Permissions::from_mode(0o755))?;
     hashes.insert("frame-comfort".into(), json!(sha256(&launcher)?));
     fs::write(
+        staging.path().join("LICENSE"),
+        include_bytes!("../../../LICENSE"),
+    )?;
+    fs::write(
         staging.path().join("OPENVR-LICENSE.txt"),
         include_bytes!("../../../OPENVR-LICENSE.txt"),
     )?;

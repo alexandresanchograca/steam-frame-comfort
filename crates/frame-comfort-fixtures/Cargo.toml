@@ -2,6 +2,7 @@
 name = "frame-comfort-fixtures"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 version.workspace = true
 publish = false
 
