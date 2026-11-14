@@ -1,0 +1,9 @@
+[package]
+name = "comfort-core"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+comfort-protocol = { path = "../comfort-protocol" }

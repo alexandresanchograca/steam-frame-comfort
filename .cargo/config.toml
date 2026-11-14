@@ -1,0 +1,3 @@
+[alias]
+# `cargo xtask package ...`, `cargo xtask e2e [TEST FILTER...]`
+xtask = "run --locked --quiet -p xtask --"

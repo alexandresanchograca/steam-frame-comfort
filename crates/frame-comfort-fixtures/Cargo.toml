@@ -1,0 +1,54 @@
+[package]
+name = "frame-comfort-fixtures"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+publish = false
+
+[lib]
+name = "frame_comfort_fake_openvr"
+crate-type = ["cdylib"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ash = "0.38"
+comfort-runtime = { path = "../comfort-runtime", features = ["steamvr"] }
+serde_json.workspace = true
+rustix = { workspace = true, features = ["event", "process"] }
+tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+comfort-core = { path = "../comfort-core" }
+tempfile = "3"
+
+[features]
+vulkan-fixtures = ["comfort-runtime/vulkan-fixtures"]
+scene-fixtures = ["comfort-runtime/scene-fixtures"]
+
+[[bin]]
+name = "frame-comfort-cadence"
+path = "src/bin/cadence.rs"
+required-features = ["vulkan-fixtures"]
+
+[[bin]]
+name = "frame-comfort-test-mailbox"
+path = "src/bin/mailbox.rs"
+
+[[bin]]
+name = "frame-comfort-local-eye-pattern"
+path = "src/bin/local_eye_pattern.rs"
+required-features = ["scene-fixtures"]
+
+[[bin]]
+name = "frame-comfort-local-xr-pattern"
+path = "src/bin/local_xr_pattern.rs"
+required-features = ["scene-fixtures"]
+
+[[bin]]
+name = "frame-comfort-stereo-screenshot"
+path = "src/bin/stereo_screenshot.rs"
+required-features = ["scene-fixtures"]
+
+[[bin]]
+name = "frame-comfort-source-producer"
+path = "src/bin/imported_source.rs"
+required-features = ["vulkan-fixtures"]

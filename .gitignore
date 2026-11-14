@@ -1,0 +1,7 @@
+/build*/
+/deps/
+/dist/
+/target/
+.DS_Store
+__pycache__/
+.claude

@@ -1,0 +1,24 @@
+[package]
+name = "comfort-runtime"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+comfort-protocol = { path = "../comfort-protocol" }
+rustix = { workspace = true, features = ["net", "process", "time"] }
+ash = { version = "0.38", optional = true }
+bytemuck.workspace = true
+comfort-core = { path = "../comfort-core" }
+serde_json.workspace = true
+tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+libloading = { version = "0.8", optional = true }
+openxr-sys = { version = "=0.14.0", default-features = false, optional = true }
+
+[build-dependencies]
+bindgen = { version = "0.72", optional = true }
+
+[features]
+steamvr = ["dep:ash", "dep:bindgen", "dep:libloading"]
+vulkan-fixtures = ["steamvr"]
+scene-fixtures = ["vulkan-fixtures", "dep:openxr-sys"]

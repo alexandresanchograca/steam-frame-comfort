@@ -1,0 +1,20 @@
+[package]
+name = "frame-comfort"
+default-run = "frame-comfort"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+comfort-core = { path = "../comfort-core" }
+serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ash = "0.38"
+comfort-runtime = { path = "../comfort-runtime", features = ["steamvr"] }
+signal-hook = "0.3"
+tempfile = "3"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
