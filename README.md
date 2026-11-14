@@ -43,9 +43,10 @@ Vulkan and fake-SteamVR suite.
 
 1. On the Frame in Desktop Mode, download the latest
    `frame-comfort-VERSION-linux-aarch64.tar.gz` from **Releases** and extract
-   it.
-2. In Steam, choose **Add a Non-Steam Game**, browse to the extracted folder
-   and pick **`frame-comfort`**.
+   it. If it offers no **Extract** option, install **Ark** from the
+   **Discover** app first.
+2. Right-click **`frame-comfort`** in the extracted folder and choose
+   **Add to Steam**.
 
 No terminal or root access is needed, and nothing outside your home folder
 is changed. More detail, including removal: [INSTALL.md](INSTALL.md).

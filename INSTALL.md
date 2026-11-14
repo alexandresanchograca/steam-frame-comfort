@@ -1,24 +1,29 @@
 # Install Frame Comfort
 
-Needs a Steam Frame with SteamVR. No terminal or root access is needed.
+Needs a Steam Frame with SteamVR. No terminal or root access is needed to
+install or use it.
 
 ## Install
 
 1. In **Desktop Mode**, download `frame-comfort-VERSION-linux-aarch64.tar.gz`
-   from **Releases** and extract it. Keep the extracted folder.
-2. In Steam, choose **Add a Non-Steam Game**, browse to that folder and pick
-   **`frame-comfort`**. Leave the compatibility tool off.
+   from **Releases**.
+2. Extract it. If right-clicking the download offers no **Extract** option,
+   install **Ark** from the **Discover** app first, then open the download
+   with Ark and extract it.
+3. In the extracted folder, right-click **`frame-comfort`** and choose
+   **Add to Steam**. It appears in your library as **frame-comfort**.
 
-## First start
+## Use
 
-1. With SteamVR running, start **frame-comfort** from your library. It
-   installs itself and opens the **Frame Comfort** panel in the SteamVR
-   dashboard.
-2. In the panel, press **RESTART STEAMVR**, then **CONFIRM RESTART**.
-   SteamVR restarts once so Comfort can see the game's picture. Do this
-   before starting a PC stream, since the restart ends it.
+1. Back in Gaming Mode, start **frame-comfort** from your library before a
+   game. It installs Comfort the first time, then opens the **Frame
+   Comfort** panel in the SteamVR dashboard.
+2. The first time, the panel says **GAME MODE NEEDS ONE STEAMVR RESTART**.
+   Press **RESTART STEAMVR**, then **CONFIRM RESTART**. The restart ends a PC
+   stream, so do it before starting one.
 
-After that, start **frame-comfort** before a game whenever you want Comfort.
+Comfort keeps running across games until you quit it or SteamVR restarts,
+so you start it once per SteamVR session.
 
 ## Update
 
@@ -42,5 +47,8 @@ yourself.
 
 - Nothing happens on start: SteamVR must be running first. Details are in
   `~/.local/state/vrw-comfort/frame-comfortctl.log`.
+- **Add to Steam** is missing from the right-click menu: the file must be
+  executable. Extracting with Ark keeps that; otherwise tick **Is
+  executable** under **Properties → Permissions**.
 - Game mode shows black: the panel's Mode line says why. A new game needs a
   few seconds of play to be recognised. Plain and Grid always work.
