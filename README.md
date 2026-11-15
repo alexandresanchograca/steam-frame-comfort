@@ -8,8 +8,19 @@ While you move with a thumbstick, the middle of your view stays live and the
 periphery holds still, fixed to your real room. Your eyes keep a stable
 reference while the game moves. Release the stick and normal VR fades back.
 
+<p align="center">
+  <img src="media/locomotion-gif.gif" width="335"
+       alt="Walking in a VR game with Frame Comfort: the centre of the view stays live while the periphery holds still">
+  <br>
+  <em>Moving with the thumbstick: the centre stays live, the periphery holds still.</em>
+</p>
+
 The periphery can show a frozen snapshot of the game that refreshes about
 once a second (**Game**), black (**Plain**) or a room-fixed grid (**Grid**).
+
+| Game mode with grid lines | The same, with the periphery dimmed |
+| :---: | :---: |
+| ![Game mode: the periphery shows a frozen snapshot of the game under room-fixed grid lines](media/non-dimmed.jpg) | ![Game mode with the periphery dimmed, leaving a bright live opening in the centre](media/dimmed.jpg) |
 
 ## The idea
 
@@ -64,6 +75,8 @@ In the panel you can choose the mode, which stick triggers it, the size of
 the live opening, fade timings, and extras such as grid lines, a crosshair or
 a fake nose. **Enabled** pauses Comfort and **Quit Comfort** stops it. When a
 new version is out, the panel offers an **UPDATE** button.
+
+![The Frame Comfort panel in the SteamVR dashboard, showing mode, stick, shape and opening size settings](media/menu-panel.jpg)
 
 Tested on SteamOS 0.4.5 with SteamVR 2.18.2.
 
