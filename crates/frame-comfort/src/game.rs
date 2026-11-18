@@ -5,8 +5,8 @@ use comfort_core::{
     },
     settings::Settings,
     source::{
-        self, Candidate, Eye, Generation, Policy, Selection, SlotSampling, SlotTracker, Stereo,
-        packed_eyes,
+        self, Candidate, Eye, EyeBounds, FULL_FIELD, Generation, Policy, Selection, SlotSampling,
+        SlotTracker, Stereo, packed_eyes,
     },
     stereo::{
         LayoutSample, LayoutVerifier, LumaThumbnail, Packing, PairTimingLearner, StereoFeatures,
@@ -340,6 +340,12 @@ pub struct Game {
     pub unstable_captures: u64,
     pub(super) fingerprint_ms: super::metrics::Samples,
     pub(super) fingerprints_taken: u64,
+    /// Apply the compositor's texture bounds to labelled eyes. Off restores
+    /// the whole-image mapping for same-session comparisons.
+    compositor_bounds: bool,
+    // The last bounds reported for each image revision. A report from a
+    // frame without a scene draw keeps the image's known mapping.
+    known_bounds: BTreeMap<u64, (u64, EyeBounds)>,
 }
 
 #[derive(Clone, Copy)]
@@ -388,7 +394,13 @@ impl Game {
             unstable_captures: 0,
             fingerprint_ms: super::metrics::Samples::default(),
             fingerprints_taken: 0,
+            compositor_bounds: true,
+            known_bounds: BTreeMap::new(),
         })
+    }
+
+    pub fn set_compositor_bounds(&mut self, enabled: bool) {
+        self.compositor_bounds = enabled;
     }
 
     pub(super) fn source_client(&self) -> &SourceClient {
@@ -462,6 +474,7 @@ impl Game {
             "gameSource": self.source_status(now),
             "stream": self.stream, "rule": self.rule(),
             "eyeSource": self.eye_source(),
+            "mapping": self.mapping_report(),
             "sourceFormat": self.generation.as_ref().map(|g| g.format),
             "extent": self.generation.as_ref().map(|g| g.extent),
             "images": self.generation.as_ref().map(|g| g.images.iter().map(|(id, _)| id).collect::<Vec<_>>()),
@@ -475,6 +488,30 @@ impl Game {
             "pairSpanMs": timing.last_span_ns as f64 / 1e6,
             "pairQuietMs": timing.last_quiet_ns as f64 / 1e6,
             "imagePairConflicts": evidence.pair_checks.iter().map(|check| u64::from(check.conflicts)).sum::<u64>(),
+        })
+    }
+
+    /// Each selected slot's eyes: image, layer, source rectangle, flips and
+    /// the part of the display eye the rectangle fills.
+    pub(super) fn mapping_report(&self) -> serde_json::Value {
+        use serde_json::json;
+        let round = |values: [f32; 4]| values.map(|value| (value * 1e4).round() / 1e4);
+        json!({
+            "compositorBounds": self.compositor_bounds,
+            "slots": self.selection.as_ref().map(|stereo| stereo.slots.iter().map(|eyes| {
+                let mut index = 0;
+                eyes.map(|eye| {
+                    // The compositor's raw bounds for this eye, when reported.
+                    let bounds = self
+                        .known_bounds
+                        .get(&eye.id)
+                        .and_then(|(_, bounds)| bounds.get(index))
+                        .map(round);
+                    index += 1;
+                    json!({"id": eye.id, "layer": eye.layer, "bounds": bounds,
+                        "crop": round(eye.crop), "flip": eye.flip, "field": round(eye.field)})
+                })
+            }).collect::<Vec<_>>()),
         })
     }
 
@@ -517,6 +554,8 @@ impl Game {
                 layout,
                 crop,
                 layer,
+                flip: [false; 2],
+                field: FULL_FIELD,
             })],
             external,
             size,
@@ -612,6 +651,7 @@ impl Game {
                 self.reason = None;
                 self.evidence = Evidence::default();
                 self.recent.clear();
+                self.known_bounds.clear();
                 self.clear_selection();
             }
         }
@@ -667,6 +707,7 @@ impl Game {
                     frame.layouts[index],
                     true,
                     frame.eyes[index],
+                    frame.bounds[index],
                 )
             })
             .chain(
@@ -678,20 +719,44 @@ impl Game {
                             frame.touched_layouts[index],
                             false,
                             frame.touched_eyes[index],
+                            frame.touched_bounds[index],
                         )
                     }),
             )
-            .filter_map(|(id, layout, acquired, eye)| {
+            .filter_map(|(id, layout, acquired, eye, bounds)| {
                 let image = self.source.images.get(&id)?;
                 Some(Candidate {
                     image: image.description,
                     layout,
                     acquired,
                     eye,
+                    bounds,
                     revision: image.revision,
                 })
             })
             .collect::<Vec<_>>();
+        self.known_bounds.retain(|id, (revision, _)| {
+            self.source
+                .images
+                .get(id)
+                .is_some_and(|image| image.revision == *revision)
+        });
+        for candidate in &mut candidates {
+            if !self.compositor_bounds {
+                candidate.bounds = EyeBounds::default();
+                continue;
+            }
+            let id = candidate.image.id;
+            let known = self
+                .known_bounds
+                .entry(id)
+                .or_insert((candidate.revision, EyeBounds::default()));
+            // Fresh bounds replace the known ones eye by eye.
+            let mut current = candidate.bounds;
+            current.merge(&known.1);
+            known.1 = current;
+            candidate.bounds = current;
+        }
         // Local render submissions may touch just the slot they updated.
         // Keep matching recent siblings in the ring as the baseline does.
         self.recent.retain(|id, (sequence, candidate)| {
@@ -925,20 +990,28 @@ impl Game {
         else {
             return Ok(false);
         };
+        // Each eye's snapshot covers only the part of the display eye its
+        // source rectangle fills, and keeps that projection.
+        let eyes: [(Pose, Projection); 2] = std::array::from_fn(|index| {
+            (eyes[index].0, eyes[index].1.restrict(chosen[index].field))
+        });
         let projection = eyes.map(|(_, projection)| projection);
         let extent = |eye: Eye| {
             let d = self.imports.get(&eye.id)?.image.description;
             Some([
-                (d.width as f32 * eye.crop[2]).round() as u32,
-                (d.height as f32 * eye.crop[3]).round() as u32,
+                (d.width as f32 * eye.crop[2]).round().max(1.0) as u32,
+                (d.height as f32 * eye.crop[3]).round().max(1.0) as u32,
             ])
         };
-        let Some(source_extent) = extent(chosen[0]) else {
+        // The eyes share one snapshot extent. Their rectangles may differ by
+        // a few texels when the compositor crops each eye differently.
+        let (Some(left), Some(right)) = (extent(chosen[0]), extent(chosen[1])) else {
             return Ok(false);
         };
-        if extent(chosen[1]) != Some(source_extent) {
+        if (0..2).any(|axis| left[axis].max(right[axis]) > 2 * left[axis].min(right[axis])) {
             return Ok(false);
         }
+        let source_extent = [left[0].max(right[0]), left[1].max(right[1])];
         let face_size = if settings.rest_frame_face_size != 0 {
             settings.rest_frame_face_size
         } else {
@@ -1044,6 +1117,7 @@ fn source_view(
         layout: ash::vk::ImageLayout::from_raw(eye.layout as i32),
         layer: eye.layer,
         crop: eye.crop,
+        flip: eye.flip,
         external,
     })
 }

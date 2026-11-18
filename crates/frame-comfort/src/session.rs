@@ -628,6 +628,7 @@ pub(super) fn run(options: Options, mut settings: Settings) -> Result<()> {
         options.check_frame_code,
         options.source_format,
     )?;
+    game.set_compositor_bounds(!options.ignore_compositor_bounds);
     let mut view = Presentation::new(&vr, Arc::clone(&render_device))?;
     let socket = options.source_socket();
     panel_texture = OverlayTexture::new(
@@ -1069,7 +1070,7 @@ pub(super) fn run(options: Options, mut settings: Settings) -> Result<()> {
                 "gridOverRing":settings.grid_over_ring,
                 "workMsP50":work_p50,"workMsP95":work_p95,
                 "compositorGapMsP50":gap_p50,"compositorGapMsP95":gap_p95,"compositorGapMsMax":gap_max,
-                "restFrame":rest_frame,
+                "restFrame":rest_frame,"sourceMapping":game.mapping_report(),
                 "gameSource":source_status,"images":game.image_count()});
             // The status file is a diagnostic. Failing to write it is reported
             // once per run of failures and never stops Comfort.

@@ -109,6 +109,7 @@ fn p010_snapshot_bands(
         layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         layer: 0,
         crop: [0.0, 0.0, 1.0, 1.0],
+        flip: [false; 2],
         external: false,
     };
     let mut renderer = SnapshotRenderer::new(Arc::clone(&context))?;
@@ -233,6 +234,7 @@ fn check_source(flag: &str, handle: vk::ExternalMemoryHandleTypeFlags) -> Result
         layout: vk::ImageLayout::GENERAL,
         layer: 0,
         crop: [0.0, 0.0, 1.0, 1.0],
+        flip: [false; 2],
         external: true,
     };
     let mut renderer = SnapshotRenderer::new(Arc::clone(&context))?;

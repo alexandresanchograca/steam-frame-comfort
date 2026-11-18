@@ -8,7 +8,7 @@ use std::mem::{offset_of, size_of};
 compile_error!("Frame Comfort's local wire format requires a little-endian host");
 
 pub const MAGIC: u32 = 0x46435256;
-pub const VERSION: u16 = 6;
+pub const VERSION: u16 = 7;
 pub const MAX_IMAGES: usize = 16;
 
 #[repr(C)]
@@ -112,6 +112,41 @@ pub struct EyeUse {
     pub layers: [u32; 2],
 }
 
+/// The compositor's texture bounds for each eye that sampled an image: the
+/// source coordinates `[u0, v0, u1, v1]` of the display eye's top-left and
+/// bottom-right, as OpenVR `VRTextureBounds_t`. A reversed axis means the
+/// image is stored upside down or mirrored. Values are `f32` bit patterns, so
+/// the packet stays comparable. Bit `1 << eye` of `valid` marks known bounds.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, Pod, Zeroable, PartialEq, Eq)]
+pub struct EyeBounds {
+    pub valid: u32,
+    pub reserved: u32,
+    pub bounds: [[u32; 4]; 2],
+}
+
+impl EyeBounds {
+    pub fn set(&mut self, eye: usize, bounds: [f32; 4]) {
+        self.valid |= 1 << eye;
+        self.bounds[eye] = bounds.map(f32::to_bits);
+    }
+
+    pub fn get(&self, eye: usize) -> Option<[f32; 4]> {
+        (eye < 2 && self.valid & (1 << eye) != 0).then(|| self.bounds[eye].map(f32::from_bits))
+    }
+
+    /// Keep the first known bounds for each eye.
+    pub fn merge(&mut self, other: &Self) {
+        for eye in 0..2 {
+            if self.get(eye).is_none()
+                && let Some(bounds) = other.get(eye)
+            {
+                self.set(eye, bounds);
+            }
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, Pod, Zeroable, PartialEq, Eq)]
 pub struct Frame {
@@ -128,17 +163,22 @@ pub struct Frame {
     pub touched_layouts: [u32; MAX_IMAGES],
     pub eyes: [EyeUse; MAX_IMAGES],
     pub touched_eyes: [EyeUse; MAX_IMAGES],
+    pub bounds: [EyeBounds; MAX_IMAGES],
+    pub touched_bounds: [EyeBounds; MAX_IMAGES],
 }
 
 pub const FRAME_SIZE_V5: usize = offset_of!(Frame, eyes);
+pub const FRAME_SIZE_V6: usize = offset_of!(Frame, bounds);
 pub const MAX_PACKET_SIZE: usize = size_of::<Frame>();
 const _: () = {
     assert!(size_of::<Hello>() == 56);
     assert!(offset_of!(ImageAdd, planes) == 152);
     assert!(size_of::<ImageAdd>() == 360);
     assert!(size_of::<ImageRemove>() == 24);
+    assert!(size_of::<EyeBounds>() == 40);
     assert!(FRAME_SIZE_V5 == 432);
-    assert!(MAX_PACKET_SIZE == 944);
+    assert!(FRAME_SIZE_V6 == 944);
+    assert!(MAX_PACKET_SIZE == 2224);
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,15 +219,19 @@ pub fn decode(bytes: &[u8]) -> Result<Packet, DecodeError> {
             Ok(Packet::Remove(bytemuck::pod_read_unaligned(bytes)))
         }
         4 => {
-            let frame: Frame = match (header.version, bytes.len()) {
-                (5, FRAME_SIZE_V5) => {
-                    let mut padded = [0; MAX_PACKET_SIZE];
-                    padded[..FRAME_SIZE_V5].copy_from_slice(bytes);
-                    bytemuck::pod_read_unaligned(&padded)
-                }
-                (VERSION, MAX_PACKET_SIZE) => bytemuck::pod_read_unaligned(bytes),
-                _ => return Err(DecodeError::Header),
+            // Older observers send a prefix of the current frame. The fields
+            // they lack decode as zero: unlabelled images and unknown bounds.
+            let size = match header.version {
+                5 => FRAME_SIZE_V5,
+                6 => FRAME_SIZE_V6,
+                _ => MAX_PACKET_SIZE,
             };
+            if bytes.len() != size {
+                return Err(DecodeError::Header);
+            }
+            let mut padded = [0; MAX_PACKET_SIZE];
+            padded[..size].copy_from_slice(bytes);
+            let frame: Frame = bytemuck::pod_read_unaligned(&padded);
             if frame.count as usize > MAX_IMAGES || frame.touched_count as usize > MAX_IMAGES {
                 return Err(DecodeError::FrameCount);
             }
@@ -229,5 +273,54 @@ mod tests {
             decode(&bytemuck::bytes_of(&frame)[..FRAME_SIZE_V5]),
             Err(DecodeError::FrameCount)
         );
+    }
+
+    #[test]
+    fn version_six_frames_decode_without_bounds_and_seven_keeps_them() {
+        let mut frame = Frame {
+            header: Header::observer::<Frame>(4),
+            count: 1,
+            ..Default::default()
+        };
+        frame.ids[0] = 7;
+        frame.eyes[0] = EyeUse {
+            eyes: 3,
+            slot: 9,
+            layers: [0, 1],
+        };
+        frame.bounds[0].set(0, [0.0, 0.0, 0.867, 1.0]);
+        frame.bounds[0].set(1, [0.134, 0.0, 1.0, 1.0]);
+        let Ok(Packet::Frame(decoded)) = decode(bytemuck::bytes_of(&frame)) else {
+            panic!("current frame did not decode");
+        };
+        assert_eq!(decoded.bounds[0].get(1), Some([0.134, 0.0, 1.0, 1.0]));
+
+        // A v6 observer (installed before an update, until SteamVR restarts)
+        // sends the labels and no bounds.
+        let mut old = frame;
+        old.header.version = 6;
+        old.header.size = FRAME_SIZE_V6 as u32;
+        let Ok(Packet::Frame(decoded)) = decode(&bytemuck::bytes_of(&old)[..FRAME_SIZE_V6]) else {
+            panic!("v6 frame did not decode");
+        };
+        assert_eq!(decoded.eyes[0], frame.eyes[0]);
+        assert_eq!(decoded.bounds[0].get(0), None);
+        // Sizes must match the declared version.
+        assert_eq!(decode(bytemuck::bytes_of(&old)), Err(DecodeError::Header));
+        old.header.size = MAX_PACKET_SIZE as u32;
+        assert_eq!(decode(bytemuck::bytes_of(&old)), Err(DecodeError::Header));
+    }
+
+    #[test]
+    fn bounds_merge_keeps_the_first_value_for_each_eye() {
+        let mut first = EyeBounds::default();
+        first.set(0, [0.0, 1.0, 1.0, 0.0]);
+        let mut second = EyeBounds::default();
+        second.set(0, [0.0, 0.0, 1.0, 1.0]);
+        second.set(1, [0.0, 1.0, 1.0, 0.0]);
+        first.merge(&second);
+        assert_eq!(first.get(0), Some([0.0, 1.0, 1.0, 0.0]));
+        assert_eq!(first.get(1), Some([0.0, 1.0, 1.0, 0.0]));
+        assert_eq!(first.get(2), None);
     }
 }

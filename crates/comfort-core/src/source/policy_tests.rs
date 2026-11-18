@@ -32,6 +32,7 @@ fn image(id: u64, format: u32, width: u32, height: u32, layers: u32) -> Candidat
         layout: GENERAL,
         acquired: format == P010,
         eye: EyeUse::default(),
+        bounds: EyeBounds::default(),
         revision: 1,
     }
 }

@@ -9,11 +9,39 @@ pub struct SourceView<'a> {
     pub image: &'a Arc<ImportedImage>,
     pub layout: vk::ImageLayout,
     pub layer: u32,
+    /// The eye's source rectangle `[x, y, width, height]`, positive size.
     pub crop: [f32; 4],
+    /// Read the rectangle's columns (x) or rows (y) in reverse, so the copy
+    /// is upright when the source is stored mirrored or bottom row first.
+    pub flip: [bool; 2],
     pub external: bool,
 }
 
 impl SourceView<'_> {
+    /// The copy's source origin and signed size, and the limits that keep
+    /// linear filtering on this rectangle's texels.
+    fn sampling(&self) -> ([f32; 4], [f32; 4]) {
+        let [x, y, width, height] = self.crop;
+        let mut signed = self.crop;
+        for axis in 0..2 {
+            if self.flip[axis] {
+                signed[axis] += signed[axis + 2];
+                signed[axis + 2] = -signed[axis + 2];
+            }
+        }
+        let description = self.image.description;
+        let half = [
+            0.5 / description.width.max(1) as f32,
+            0.5 / description.height.max(1) as f32,
+        ];
+        let low = [x + half[0], y + half[1]];
+        let high = [
+            (x + width - half[0]).max(low[0]),
+            (y + height - half[1]).max(low[1]),
+        ];
+        (signed, [low[0], low[1], high[0], high[1]])
+    }
+
     fn key(&self) -> (u64, u32, i32) {
         (
             self.image.handle().as_raw(),
@@ -263,7 +291,7 @@ impl SnapshotRenderer {
                         },
                     }],
                 );
-                let [u, v, w, h] = eye.crop;
+                let ([u, v, w, h], limits) = eye.sampling();
                 let push = [
                     u,
                     v,
@@ -277,6 +305,10 @@ impl SnapshotRenderer {
                     0.0,
                     index as f32,
                     f32::from(binding.srgb),
+                    limits[0],
+                    limits[1],
+                    limits[2],
+                    limits[3],
                     0.0,
                 ];
                 device.cmd_push_constants(
@@ -619,7 +651,7 @@ impl Binding {
             );
             let ranges = [vk::PushConstantRange::default()
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-                .size(52)];
+                .size(68)];
             binding.layout = device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
                     .set_layouts(&layouts)
