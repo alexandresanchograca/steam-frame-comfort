@@ -1,5 +1,5 @@
 use super::*;
-use comfort_protocol::{EyeUse, Frame, Header, ImageAdd, MAX_IMAGES, Plane, Ycbcr};
+use comfort_protocol::{EyeBounds, EyeUse, Frame, Header, ImageAdd, MAX_IMAGES, Plane, Ycbcr};
 use std::{
     collections::BTreeMap,
     os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd},
@@ -54,6 +54,67 @@ struct Recording {
     pushed: [BTreeMap<(u32, u32), ViewUse>; 8],
     area: Option<vk::Rect2D>,
     viewport: Option<vk::Viewport>,
+    pipeline: vk::Pipeline,
+    // Dynamic offsets for each graphics set, keyed by binding and element.
+    dynamic: [BTreeMap<(u32, u32), u32>; 8],
+    pushed_buffers: [BTreeMap<(u32, u32), BufferUse>; 8],
+    traced: Vec<trace::TracedDraw>,
+    bounds: Vec<BoundsRead>,
+}
+
+/// An eye's texture bounds for an image, to read from the compositor's
+/// per-submission block when the command buffer is submitted.
+#[derive(Clone)]
+struct BoundsRead {
+    id: u64,
+    eye: usize,
+    slot: usize,
+    block: BoundBuffer,
+}
+
+/// A buffer binding resolved to device memory when the draw was recorded.
+#[derive(Clone)]
+struct BoundBuffer {
+    set: u32,
+    binding: u32,
+    element: u32,
+    kind: i32,
+    offset: u64,
+    dynamic: Option<u32>,
+    memory: Option<(vk::DeviceMemory, u64)>,
+    range: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct PipelineInfo {
+    stages: [u64; 2],
+    /// Set 0 bindings of the per-submission block and the scene images.
+    scene: Option<(u32, u32)>,
+}
+
+#[derive(Clone, Copy)]
+struct BufferUse {
+    buffer: vk::Buffer,
+    offset: u64,
+    range: u64,
+    kind: vk::DescriptorType,
+}
+
+impl BufferUse {
+    fn dynamic(&self) -> bool {
+        matches!(
+            self.kind,
+            vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
+        )
+    }
+}
+
+/// A host mapping of device memory.
+#[derive(Clone, Copy)]
+struct Mapped {
+    pointer: usize,
+    offset: u64,
+    size: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -75,12 +136,19 @@ struct State {
     sets: HashMap<(vk::Device, vk::DescriptorSet), Set>,
     templates: HashMap<(vk::Device, vk::DescriptorUpdateTemplate), Template>,
     frame: Option<Frame>,
+    // Host-visible bookkeeping used to read the compositor's per-draw blocks.
+    sizes: HashMap<(vk::Device, vk::DeviceMemory), u64>,
+    maps: HashMap<(vk::Device, vk::DeviceMemory), Mapped>,
+    buffers: HashMap<(vk::Device, vk::Buffer), (vk::DeviceMemory, u64)>,
+    modules: HashMap<(vk::Device, vk::ShaderModule), spirv::ShaderInfo>,
+    pipelines: HashMap<(vk::Device, vk::Pipeline), PipelineInfo>,
 }
 
 #[derive(Default, Clone)]
 struct Set {
     pool: vk::DescriptorPool,
     bindings: BTreeMap<(u32, u32), ViewUse>,
+    buffers: BTreeMap<(u32, u32), BufferUse>,
 }
 
 struct Template {
@@ -134,6 +202,11 @@ pub fn retire_device(device: vk::Device) {
     state.views.retain(|(owner, _), _| *owner != device);
     state.sets.retain(|(owner, _), _| *owner != device);
     state.templates.retain(|(owner, _), _| *owner != device);
+    state.sizes.retain(|(owner, _), _| *owner != device);
+    state.maps.retain(|(owner, _), _| *owner != device);
+    state.buffers.retain(|(owner, _), _| *owner != device);
+    state.modules.retain(|(owner, _), _| *owner != device);
+    state.pipelines.retain(|(owner, _), _| *owner != device);
     state.frame = None;
     state.metadata_changed();
 }
@@ -246,6 +319,7 @@ impl State {
             return;
         };
         let mut labels = Vec::new();
+        let mut elements = Vec::new();
         for (index, &set) in rec.graphics.iter().enumerate() {
             let entries = self
                 .sets
@@ -253,10 +327,27 @@ impl State {
                 .into_iter()
                 .flat_map(|set| set.bindings.iter())
                 .chain(&rec.pushed[index]);
-            for (&(binding, _), value) in entries {
+            for (&(binding, element), value) in entries {
                 if let Some((id, layer)) = self.used_view(device, value.view) {
                     labels.push((id, binding, layer));
+                    elements.push((index, element));
                 }
+            }
+        }
+        let reads = self.bounds_reads(device, command, eye, &labels, &elements);
+        if let Some(rec) = self.recordings.get_mut(&(device, command)) {
+            for read in reads {
+                if rec.bounds.len() < 64 {
+                    rec.bounds.push(read);
+                }
+            }
+        }
+        if !labels.is_empty() && trace::enabled() {
+            let traced = self.traced_draw(device, command, eye, &labels, area, viewport);
+            if let Some(rec) = self.recordings.get_mut(&(device, command))
+                && rec.traced.len() < 16
+            {
+                rec.traced.push(traced);
             }
         }
         if let Some(rec) = self.recordings.get_mut(&(device, command)) {
@@ -279,10 +370,14 @@ impl State {
     fn submit(&mut self, device: vk::Device, commands: impl Iterator<Item = vk::CommandBuffer>) {
         let mut images = Vec::new();
         let mut labels = BTreeMap::new();
+        let mut traced = Vec::new();
+        let mut reads = Vec::new();
         for command in commands {
             let Some(rec) = self.recordings.get(&(device, command)) else {
                 continue;
             };
+            traced.extend(rec.traced.iter().cloned());
+            reads.extend(rec.bounds.iter().cloned());
             for &value in &rec.images {
                 add_image(&mut images, value);
             }
@@ -307,25 +402,38 @@ impl State {
                 }
             }
         }
+        let mut bounds = BTreeMap::<u64, EyeBounds>::new();
+        for read in &reads {
+            if let Some(value) = self.read_bounds(device, read) {
+                let mut known = EyeBounds::default();
+                known.set(read.eye, value);
+                bounds.entry(read.id).or_default().merge(&known);
+            }
+        }
+        let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+        let now_ns = now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64;
+        if !traced.is_empty() && trace::due(now_ns) {
+            self.trace_submit(device, &traced, now_ns);
+        }
         if images.is_empty() {
             return;
         }
         self.sequence = self.sequence.wrapping_add(1);
-        let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
         let mut frame = Frame {
             header: Header::observer::<Frame>(4),
             sequence: self.sequence,
-            monotonic_ns: now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64,
+            monotonic_ns: now_ns,
             ..Default::default()
         };
         for image in images {
-            let (count, truncated, ids, layouts, eyes) = if image.external {
+            let (count, truncated, ids, layouts, eyes, mapped) = if image.external {
                 (
                     &mut frame.count,
                     &mut frame.truncated,
                     &mut frame.ids,
                     &mut frame.layouts,
                     &mut frame.eyes,
+                    &mut frame.bounds,
                 )
             } else {
                 (
@@ -334,6 +442,7 @@ impl State {
                     &mut frame.touched_ids,
                     &mut frame.touched_layouts,
                     &mut frame.touched_eyes,
+                    &mut frame.touched_bounds,
                 )
             };
             let index = *count as usize;
@@ -344,6 +453,7 @@ impl State {
             ids[index] = image.id;
             layouts[index] = image.layout;
             eyes[index] = labels.get(&image.id).copied().unwrap_or_default();
+            mapped[index] = bounds.get(&image.id).copied().unwrap_or_default();
             *count += 1;
         }
         self.frame = Some(frame);
@@ -372,6 +482,190 @@ fn merge_eye(uses: &mut BTreeMap<u64, EyeUse>, id: u64, label: EyeUse) {
         old.eyes |= label.eyes;
     } else if uses.len() < 64 {
         uses.insert(id, label);
+    }
+}
+
+impl State {
+    /// Resolve a buffer descriptor of a recorded draw to its device memory.
+    fn bound_buffer(
+        &self,
+        device: vk::Device,
+        rec: &Recording,
+        set: usize,
+        (binding, element): (u32, u32),
+        value: &BufferUse,
+    ) -> BoundBuffer {
+        let memory = self.buffers.get(&(device, value.buffer)).copied();
+        let range = if value.range == vk::WHOLE_SIZE {
+            memory
+                .and_then(|(memory, base)| {
+                    self.sizes
+                        .get(&(device, memory))
+                        .map(|size| size.saturating_sub(base + value.offset))
+                })
+                .unwrap_or(0)
+        } else {
+            value.range
+        };
+        BoundBuffer {
+            set: set as u32,
+            binding,
+            element,
+            kind: value.kind.as_raw(),
+            offset: value.offset,
+            dynamic: value
+                .dynamic()
+                .then(|| rec.dynamic[set].get(&(binding, element)).copied())
+                .flatten(),
+            memory,
+            range,
+        }
+    }
+
+    /// Host words of a bound buffer from byte `at`, if the memory is mapped.
+    fn read_words(
+        &self,
+        device: vk::Device,
+        bound: &BoundBuffer,
+        at: u64,
+        length: u64,
+    ) -> Option<Vec<u32>> {
+        let (memory, base) = bound.memory?;
+        let mapped = self.maps.get(&(device, memory))?;
+        let length = length & !3;
+        if length == 0 || at.checked_add(length)? > bound.range {
+            return None;
+        }
+        let start = base
+            .checked_add(bound.offset)?
+            .checked_add(u64::from(bound.dynamic.unwrap_or(0)))?
+            .checked_add(at)?;
+        let end = start.checked_add(length)?;
+        if start < mapped.offset || end > mapped.offset.checked_add(mapped.size)? {
+            return None;
+        }
+        let mut words = vec![0_u32; (length / 4) as usize];
+        // SAFETY: The range lies inside a live host mapping. Unmap and free
+        // remove the mapping under the same lock before calling down.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (mapped.pointer + (start - mapped.offset) as usize) as *const u8,
+                words.as_mut_ptr().cast::<u8>(),
+                length as usize,
+            );
+        }
+        Some(words)
+    }
+
+    /// For a recognised scene pipeline, the per-submission block and each
+    /// labelled image's submission slot.
+    fn bounds_reads(
+        &self,
+        device: vk::Device,
+        command: vk::CommandBuffer,
+        eye: usize,
+        labels: &[(u64, u32, u32)],
+        elements: &[(usize, u32)],
+    ) -> Vec<BoundsRead> {
+        let Some(rec) = self.recordings.get(&(device, command)) else {
+            return Vec::new();
+        };
+        let Some((block_binding, image_binding)) = self
+            .pipelines
+            .get(&(device, rec.pipeline))
+            .and_then(|pipeline| pipeline.scene)
+        else {
+            return Vec::new();
+        };
+        let key = (block_binding, 0);
+        let Some(block) = self
+            .sets
+            .get(&(device, rec.graphics[0]))
+            .and_then(|set| set.buffers.get(&key))
+            .or_else(|| rec.pushed_buffers[0].get(&key))
+            .map(|value| self.bound_buffer(device, rec, 0, key, value))
+        else {
+            return Vec::new();
+        };
+        labels
+            .iter()
+            .zip(elements)
+            .filter_map(|(&(id, binding, _), &(set, element))| {
+                // The images are three consecutive descriptors from the
+                // array's binding, as elements or as following bindings.
+                let slot = (set == 0 && binding >= image_binding)
+                    .then(|| (binding - image_binding) as usize + element as usize)
+                    .filter(|&slot| slot < spirv::SLOTS)?;
+                Some(BoundsRead {
+                    id,
+                    eye,
+                    slot,
+                    block: block.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Plausible texture bounds for a queued read.
+    fn read_bounds(&self, device: vk::Device, read: &BoundsRead) -> Option<[f32; 4]> {
+        let words = self.read_words(
+            device,
+            &read.block,
+            spirv::bounds_offset(read.slot, read.eye),
+            64,
+        )?;
+        let matrix: [f32; 16] = std::array::from_fn(|index| f32::from_bits(words[index]));
+        let bounds = spirv::bounds_from_matrix(&matrix);
+        let [u0, v0, u1, v1] = bounds;
+        let plausible = bounds
+            .iter()
+            .all(|value| value.is_finite() && value.abs() <= 8.0)
+            && [(u1 - u0).abs(), (v1 - v0).abs()]
+                .iter()
+                .all(|span| (0.05..=8.0).contains(span));
+        plausible.then_some(bounds)
+    }
+
+    /// The pipeline and the graphics buffer bindings of a labelled draw.
+    fn traced_draw(
+        &self,
+        device: vk::Device,
+        command: vk::CommandBuffer,
+        eye: usize,
+        labels: &[(u64, u32, u32)],
+        area: vk::Rect2D,
+        viewport: vk::Viewport,
+    ) -> trace::TracedDraw {
+        let rec = &self.recordings[&(device, command)];
+        let mut buffers = Vec::new();
+        for (index, &set) in rec.graphics.iter().enumerate().take(4) {
+            let entries = self
+                .sets
+                .get(&(device, set))
+                .into_iter()
+                .flat_map(|set| set.buffers.iter())
+                .chain(&rec.pushed_buffers[index]);
+            for (&key, value) in entries {
+                buffers.push(self.bound_buffer(device, rec, index, key, value));
+            }
+        }
+        trace::TracedDraw {
+            eye,
+            labels: labels.to_vec(),
+            stages: self
+                .pipelines
+                .get(&(device, rec.pipeline))
+                .map(|pipeline| pipeline.stages)
+                .unwrap_or_default(),
+            viewport: [viewport.x, viewport.y, viewport.width, viewport.height],
+            area: [
+                area.offset.x,
+                area.offset.y,
+                area.extent.width as i32,
+                area.extent.height as i32,
+            ],
+            buffers,
+        }
     }
 }
 
@@ -471,6 +765,14 @@ unsafe extern "system" fn allocate_memory(
     if state.active && result == vk::Result::SUCCESS {
         observe_safely(|| {
             if let (Some(info), Some(memory)) = (info.as_ref(), output.as_ref()) {
+                {
+                    let mut global = source();
+                    if global.sizes.len() < 65536 {
+                        global
+                            .sizes
+                            .insert((device_handle, *memory), info.allocation_size);
+                    }
+                }
                 observe_memory(&state, info, *memory, import);
             }
         });
@@ -658,8 +960,248 @@ macro_rules! void_hook {
     };
 }
 
-void_hook!(free_memory, c"vkFreeMemory", PFN_vkFreeMemory, dev: vk::Device, memory: vk::DeviceMemory, allocator: *const vk::AllocationCallbacks<'_>;
-    |_state| { source().memory.remove(&(dev, memory)); });
+unsafe extern "system" fn free_memory(
+    dev: vk::Device,
+    memory: vk::DeviceMemory,
+    allocator: *const vk::AllocationCallbacks<'_>,
+) {
+    let Some(state) = device(dev) else { return };
+    let Some(next) = state.function::<vk::PFN_vkFreeMemory>(c"vkFreeMemory") else {
+        return;
+    };
+    // Freeing unmaps, so forget the mapping before the memory goes away.
+    if state.active {
+        observe_safely(|| {
+            let mut global = source();
+            global.memory.remove(&(dev, memory));
+            global.maps.remove(&(dev, memory));
+            global.sizes.remove(&(dev, memory));
+        });
+    }
+    next(dev, memory, allocator);
+}
+
+unsafe extern "system" fn map_memory(
+    dev: vk::Device,
+    memory: vk::DeviceMemory,
+    offset: u64,
+    size: u64,
+    flags: vk::MemoryMapFlags,
+    data: *mut *mut c_void,
+) -> vk::Result {
+    let Some(state) = device(dev) else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let Some(next) = state.function::<vk::PFN_vkMapMemory>(c"vkMapMemory") else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let result = next(dev, memory, offset, size, flags, data);
+    if state.active && result == vk::Result::SUCCESS {
+        observe_safely(|| record_map(dev, memory, offset, size, data));
+    }
+    result
+}
+
+unsafe fn record_map(
+    dev: vk::Device,
+    memory: vk::DeviceMemory,
+    offset: u64,
+    size: u64,
+    data: *mut *mut c_void,
+) {
+    let Some(&pointer) = data.as_ref() else {
+        return;
+    };
+    if pointer.is_null() {
+        return;
+    }
+    let mut global = source();
+    let size = if size == vk::WHOLE_SIZE {
+        let Some(total) = global.sizes.get(&(dev, memory)) else {
+            return;
+        };
+        total.saturating_sub(offset)
+    } else {
+        size
+    };
+    if global.maps.len() < 65536 {
+        global.maps.insert(
+            (dev, memory),
+            Mapped {
+                pointer: pointer as usize,
+                offset,
+                size,
+            },
+        );
+    }
+}
+
+unsafe extern "system" fn unmap_memory(dev: vk::Device, memory: vk::DeviceMemory) {
+    let Some(state) = device(dev) else { return };
+    let Some(next) = state.function::<vk::PFN_vkUnmapMemory>(c"vkUnmapMemory") else {
+        return;
+    };
+    if state.active {
+        observe_safely(|| {
+            source().maps.remove(&(dev, memory));
+        });
+    }
+    next(dev, memory);
+}
+
+unsafe extern "system" fn bind_buffer(
+    dev: vk::Device,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    offset: u64,
+) -> vk::Result {
+    let Some(state) = device(dev) else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let Some(next) = state.function::<vk::PFN_vkBindBufferMemory>(c"vkBindBufferMemory") else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let result = next(dev, buffer, memory, offset);
+    if state.active && result == vk::Result::SUCCESS {
+        observe_safely(|| {
+            let mut global = source();
+            if global.buffers.len() < 65536 {
+                global.buffers.insert((dev, buffer), (memory, offset));
+            }
+        });
+    }
+    result
+}
+
+unsafe fn bind_buffers(
+    dev: vk::Device,
+    count: u32,
+    info: *const vk::BindBufferMemoryInfo<'_>,
+    result: vk::Result,
+) {
+    if result != vk::Result::SUCCESS {
+        return;
+    }
+    let mut global = source();
+    for bind in slice(info, count, 4096) {
+        if global.buffers.len() < 65536 {
+            global
+                .buffers
+                .insert((dev, bind.buffer), (bind.memory, bind.memory_offset));
+        }
+    }
+}
+
+void_hook!(destroy_buffer, c"vkDestroyBuffer", PFN_vkDestroyBuffer, dev: vk::Device, buffer: vk::Buffer, allocator: *const vk::AllocationCallbacks<'_>;
+    |_state| { source().buffers.remove(&(dev, buffer)); });
+result_hook!(bind_buffer2, c"vkBindBufferMemory2", PFN_vkBindBufferMemory2, dev: vk::Device, count: u32, info: *const vk::BindBufferMemoryInfo<'_>;
+    |_state, result| { bind_buffers(dev, count, info, result); });
+result_hook!(bind_buffer2_khr, c"vkBindBufferMemory2KHR", PFN_vkBindBufferMemory2, dev: vk::Device, count: u32, info: *const vk::BindBufferMemoryInfo<'_>;
+    |_state, result| { bind_buffers(dev, count, info, result); });
+
+unsafe fn shader_info(info: &vk::ShaderModuleCreateInfo<'_>) -> spirv::ShaderInfo {
+    if info.p_code.is_null()
+        || info.code_size == 0
+        || info.code_size > 64 << 20
+        || !info.code_size.is_multiple_of(4)
+    {
+        return spirv::ShaderInfo::default();
+    }
+    let words = std::slice::from_raw_parts(info.p_code, info.code_size / 4);
+    let hash = trace::hash(std::slice::from_raw_parts(
+        info.p_code.cast::<u8>(),
+        info.code_size,
+    ));
+    spirv::inspect(words, hash)
+}
+
+result_hook!(create_module, c"vkCreateShaderModule", PFN_vkCreateShaderModule, dev: vk::Device,
+info: *const vk::ShaderModuleCreateInfo<'_>, allocator: *const vk::AllocationCallbacks<'_>, output: *mut vk::ShaderModule;
+|_state, result| {
+    if result == vk::Result::SUCCESS && let (Some(info), Some(&module)) = (info.as_ref(), output.as_ref()) {
+        let shader = shader_info(info);
+        let mut global = source();
+        if global.modules.len() < 65536 {
+            global.modules.insert((dev, module), shader);
+        }
+    }
+});
+void_hook!(destroy_module, c"vkDestroyShaderModule", PFN_vkDestroyShaderModule, dev: vk::Device,
+    module: vk::ShaderModule, allocator: *const vk::AllocationCallbacks<'_>;
+    |_state| { source().modules.remove(&(dev, module)); });
+
+unsafe fn record_pipelines(
+    dev: vk::Device,
+    count: u32,
+    infos: *const vk::GraphicsPipelineCreateInfo<'_>,
+    output: *const vk::Pipeline,
+) {
+    let mut global = source();
+    for (info, &pipeline) in slice(infos, count, 4096)
+        .iter()
+        .zip(slice(output, count, 4096))
+    {
+        if pipeline == vk::Pipeline::null() {
+            continue;
+        }
+        let mut shaders = [spirv::ShaderInfo::default(); 2];
+        for stage in slice(info.p_stages, info.stage_count, 16) {
+            let index = if stage.stage == vk::ShaderStageFlags::VERTEX {
+                0
+            } else if stage.stage == vk::ShaderStageFlags::FRAGMENT {
+                1
+            } else {
+                continue;
+            };
+            shaders[index] = if stage.module != vk::ShaderModule::null() {
+                global
+                    .modules
+                    .get(&(dev, stage.module))
+                    .copied()
+                    .unwrap_or_default()
+            } else {
+                next_info::<vk::ShaderModuleCreateInfo<'_>>(stage.p_next)
+                    .map_or_else(spirv::ShaderInfo::default, |info| shader_info(&*info))
+            };
+        }
+        let [vertex, fragment] = shaders;
+        let pipeline_info = PipelineInfo {
+            stages: shaders.map(|shader| shader.hash),
+            scene: vertex.slot_block.zip(fragment.slot_images),
+        };
+        if trace::enabled() {
+            trace::write_line(&format!(
+                "{{\"pipeline\":{},\"vs\":\"{:016x}\",\"fs\":\"{:016x}\",\"scene\":{}}}",
+                pipeline.as_raw(),
+                vertex.hash,
+                fragment.hash,
+                pipeline_info.scene.is_some()
+            ));
+        }
+        if global.pipelines.len() < 65536 {
+            global.pipelines.insert((dev, pipeline), pipeline_info);
+        }
+    }
+}
+
+result_hook!(create_pipelines, c"vkCreateGraphicsPipelines", PFN_vkCreateGraphicsPipelines, dev: vk::Device,
+cache: vk::PipelineCache, count: u32, infos: *const vk::GraphicsPipelineCreateInfo<'_>,
+allocator: *const vk::AllocationCallbacks<'_>, output: *mut vk::Pipeline;
+|_state, result| {
+    if matches!(result, vk::Result::SUCCESS | vk::Result::PIPELINE_COMPILE_REQUIRED) {
+        record_pipelines(dev, count, infos, output);
+    }
+});
+void_hook!(destroy_pipeline, c"vkDestroyPipeline", PFN_vkDestroyPipeline, dev: vk::Device,
+    pipeline: vk::Pipeline, allocator: *const vk::AllocationCallbacks<'_>;
+    |_state| { source().pipelines.remove(&(dev, pipeline)); });
+void_hook!(bind_pipeline, c"vkCmdBindPipeline", PFN_vkCmdBindPipeline, cmd: vk::CommandBuffer,
+point: vk::PipelineBindPoint, pipeline: vk::Pipeline;
+|state| {
+    if point == vk::PipelineBindPoint::GRAPHICS {
+        source().recordings.entry((state.handle, cmd)).or_default().pipeline = pipeline;
+    }
+});
 void_hook!(destroy_image, c"vkDestroyImage", PFN_vkDestroyImage, dev: vk::Device, image: vk::Image, allocator: *const vk::AllocationCallbacks<'_>;
     |_state| { let mut global = source(); if global.images.remove(&(dev, image)).is_some() { global.metadata_changed(); } });
 result_hook!(bind_image2, c"vkBindImageMemory2", PFN_vkBindImageMemory2, dev: vk::Device, count: u32, info: *const vk::BindImageMemoryInfo<'_>;
@@ -869,6 +1411,59 @@ fn write_descriptor(
     }
 }
 
+fn buffer_descriptor(ty: vk::DescriptorType) -> bool {
+    matches!(
+        ty,
+        vk::DescriptorType::UNIFORM_BUFFER
+            | vk::DescriptorType::STORAGE_BUFFER
+            | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+            | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
+    )
+}
+
+fn write_buffer(
+    buffers: &mut BTreeMap<(u32, u32), BufferUse>,
+    key: (u32, u32),
+    kind: vk::DescriptorType,
+    info: vk::DescriptorBufferInfo,
+) {
+    if info.buffer == vk::Buffer::null() {
+        buffers.remove(&key);
+    } else if buffers.len() < 256 || buffers.contains_key(&key) {
+        buffers.insert(
+            key,
+            BufferUse {
+                buffer: info.buffer,
+                offset: info.offset,
+                range: info.range,
+                kind,
+            },
+        );
+    }
+}
+
+unsafe fn write_set_buffers(
+    buffers: &mut BTreeMap<(u32, u32), BufferUse>,
+    write: &vk::WriteDescriptorSet<'_>,
+) {
+    if buffer_descriptor(write.descriptor_type) {
+        for (index, &info) in slice(write.p_buffer_info, write.descriptor_count, 256)
+            .iter()
+            .enumerate()
+        {
+            write_buffer(
+                buffers,
+                (
+                    write.dst_binding,
+                    write.dst_array_element.saturating_add(index as u32),
+                ),
+                write.descriptor_type,
+                info,
+            );
+        }
+    }
+}
+
 unsafe fn write_set(
     bindings: &mut BTreeMap<(u32, u32), ViewUse>,
     write: &vk::WriteDescriptorSet<'_>,
@@ -924,6 +1519,7 @@ copy_count: u32, copies: *const vk::CopyDescriptorSet<'_>; |_state| {
     for write in slice(writes, write_count, 65536) {
         if let Some(set) = global.sets.get_mut(&(dev, write.dst_set)) {
             write_set(&mut set.bindings, write);
+            write_set_buffers(&mut set.buffers, write);
         }
     }
     for copy in slice(copies, copy_count, 65536) {
@@ -931,11 +1527,17 @@ copy_count: u32, copies: *const vk::CopyDescriptorSet<'_>; |_state| {
             let value = global.sets.get(&(dev, copy.src_set))
                 .and_then(|set| set.bindings.get(&(copy.src_binding, copy.src_array_element.saturating_add(index))))
                 .copied();
+            let buffer = global.sets.get(&(dev, copy.src_set))
+                .and_then(|set| set.buffers.get(&(copy.src_binding, copy.src_array_element.saturating_add(index))))
+                .copied();
             if let Some(set) = global.sets.get_mut(&(dev, copy.dst_set)) {
                 let key = (copy.dst_binding, copy.dst_array_element.saturating_add(index));
                 if let Some(value) = value {
                     if set.bindings.len() < 4096 || set.bindings.contains_key(&key) { set.bindings.insert(key, value); }
                 } else { set.bindings.remove(&key); }
+                if let Some(buffer) = buffer {
+                    if set.buffers.len() < 256 || set.buffers.contains_key(&key) { set.buffers.insert(key, buffer); }
+                } else { set.buffers.remove(&key); }
             }
         }
     }
@@ -1015,6 +1617,51 @@ unsafe fn template_values(
     values
 }
 
+unsafe fn template_buffers(
+    entries: &[vk::DescriptorUpdateTemplateEntry],
+    bytes: *const c_void,
+) -> Vec<((u32, u32), vk::DescriptorType, vk::DescriptorBufferInfo)> {
+    if bytes.is_null() {
+        return Vec::new();
+    }
+    let mut values = Vec::new();
+    for entry in entries {
+        if !buffer_descriptor(entry.descriptor_type) {
+            continue;
+        }
+        for index in 0..entry.descriptor_count.min(256) {
+            let Some(offset) = entry
+                .stride
+                .checked_mul(index as usize)
+                .and_then(|offset| entry.offset.checked_add(offset))
+            else {
+                break;
+            };
+            if offset > isize::MAX as usize - mem::size_of::<vk::DescriptorBufferInfo>() {
+                break;
+            }
+            // The next Vulkan implementation accepted this template and data.
+            let info = bytes
+                .cast::<u8>()
+                .add(offset)
+                .cast::<vk::DescriptorBufferInfo>()
+                .read_unaligned();
+            values.push((
+                (
+                    entry.dst_binding,
+                    entry.dst_array_element.saturating_add(index),
+                ),
+                entry.descriptor_type,
+                info,
+            ));
+            if values.len() >= 256 {
+                return values;
+            }
+        }
+    }
+    values
+}
+
 unsafe fn update_template_record(
     dev: vk::Device,
     set: vk::DescriptorSet,
@@ -1026,9 +1673,13 @@ unsafe fn update_template_record(
         return;
     };
     let values = template_values(&template.entries, data);
+    let buffers = template_buffers(&template.entries, data);
     if let Some(set) = global.sets.get_mut(&(dev, set)) {
         for (key, info) in values {
             write_descriptor(&mut set.bindings, key, info);
+        }
+        for (key, kind, info) in buffers {
+            write_buffer(&mut set.buffers, key, kind, info);
         }
     }
 }
@@ -1050,14 +1701,27 @@ void_hook!(update_template_khr, c"vkUpdateDescriptorSetWithTemplateKHR", PFN_vkU
 
 void_hook!(bind_sets, c"vkCmdBindDescriptorSets", PFN_vkCmdBindDescriptorSets, cmd: vk::CommandBuffer,
 bind_point: vk::PipelineBindPoint, _layout: vk::PipelineLayout, first: u32, count: u32, sets: *const vk::DescriptorSet,
-_offset_count: u32, _offsets: *const u32; |state| {
+offset_count: u32, offsets: *const u32; |state| {
     if bind_point != vk::PipelineBindPoint::GRAPHICS { return; }
     let mut global = source();
+    // Dynamic offsets apply in set order, then binding and element order.
+    let mut remaining = slice(offsets, offset_count, 256).iter().copied();
+    let dynamic: Vec<BTreeMap<(u32, u32), u32>> = slice(sets, count, 64).iter().map(|set| {
+        global.sets.get(&(state.handle, *set)).map(|set| {
+            set.buffers.iter().filter(|(_, value)| value.dynamic())
+                .filter_map(|(&key, _)| Some((key, remaining.next()?))).collect()
+        }).unwrap_or_default()
+    }).collect();
     let rec = global.recordings.entry((state.handle, cmd)).or_default();
-    for (index, &set) in slice(sets, count, 64).iter().enumerate() {
+    for ((index, &set), dynamic) in slice(sets, count, 64).iter().enumerate().zip(dynamic) {
         if rec.bound.len() < 64 && !rec.bound.contains(&set) { rec.bound.push(set); }
         let index = first as usize + index;
-        if index < rec.graphics.len() { rec.graphics[index] = set; rec.pushed[index].clear(); }
+        if index < rec.graphics.len() {
+            rec.graphics[index] = set;
+            rec.pushed[index].clear();
+            rec.pushed_buffers[index].clear();
+            rec.dynamic[index] = dynamic;
+        }
     }
 });
 
@@ -1077,6 +1741,7 @@ unsafe fn push_set_record(
     rec.graphics[set as usize] = vk::DescriptorSet::null();
     for write in slice(writes, count, 4096) {
         write_set(&mut rec.pushed[set as usize], write);
+        write_set_buffers(&mut rec.pushed_buffers[set as usize], write);
     }
 }
 
@@ -1099,10 +1764,14 @@ unsafe fn push_template_record(
         return;
     };
     let values = template_values(&template.entries, data);
+    let buffers = template_buffers(&template.entries, data);
     let rec = global.recordings.entry((state.handle, cmd)).or_default();
     rec.graphics[set as usize] = vk::DescriptorSet::null();
     for (key, info) in values {
         write_descriptor(&mut rec.pushed[set as usize], key, info);
+    }
+    for (key, kind, info) in buffers {
+        write_buffer(&mut rec.pushed_buffers[set as usize], key, kind, info);
     }
 }
 
@@ -1192,6 +1861,17 @@ macro_rules! hooks {
 hooks! {
     c"vkAllocateMemory" => allocate_memory: PFN_vkAllocateMemory,
     c"vkFreeMemory" => free_memory: PFN_vkFreeMemory,
+    c"vkMapMemory" => map_memory: PFN_vkMapMemory,
+    c"vkUnmapMemory" => unmap_memory: PFN_vkUnmapMemory,
+    c"vkBindBufferMemory" => bind_buffer: PFN_vkBindBufferMemory,
+    c"vkBindBufferMemory2" => bind_buffer2: PFN_vkBindBufferMemory2,
+    c"vkBindBufferMemory2KHR" => bind_buffer2_khr: PFN_vkBindBufferMemory2,
+    c"vkDestroyBuffer" => destroy_buffer: PFN_vkDestroyBuffer,
+    c"vkCreateShaderModule" => create_module: PFN_vkCreateShaderModule,
+    c"vkDestroyShaderModule" => destroy_module: PFN_vkDestroyShaderModule,
+    c"vkCreateGraphicsPipelines" => create_pipelines: PFN_vkCreateGraphicsPipelines,
+    c"vkDestroyPipeline" => destroy_pipeline: PFN_vkDestroyPipeline,
+    c"vkCmdBindPipeline" => bind_pipeline: PFN_vkCmdBindPipeline,
     c"vkCreateImage" => create_image: PFN_vkCreateImage,
     c"vkDestroyImage" => destroy_image: PFN_vkDestroyImage,
     c"vkBindImageMemory" => bind_image: PFN_vkBindImageMemory,
@@ -1248,6 +1928,9 @@ hooks! {
     c"vkCmdDrawIndirect" => draw_indirect: PFN_vkCmdDrawIndirect,
     c"vkCmdDrawIndexedIndirect" => draw_indexed_indirect: PFN_vkCmdDrawIndexedIndirect,
 }
+
+mod spirv;
+mod trace;
 
 #[cfg(test)]
 mod contract;
@@ -1346,5 +2029,131 @@ mod tests {
         global.draw(device, cmd);
         global.submit(device, [cmd].into_iter());
         assert_eq!(global.frame.unwrap().touched_eyes[0], EyeUse::default());
+    }
+
+    /// One array image sampled by a recognised scene pipeline, both eyes,
+    /// with the compositor's per-submission block in host memory.
+    fn scene(block: &mut [u32], scene: bool) -> State {
+        let device = vk::Device::from_raw(1);
+        let cmd = vk::CommandBuffer::from_raw(2);
+        let image = vk::Image::from_raw(3);
+        let [left, right] = [4, 5].map(vk::ImageView::from_raw);
+        let descriptor = vk::DescriptorSet::from_raw(6);
+        let [buffer, memory, pipeline] = [7_u64, 8, 9];
+        let fd: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        let description = ImageAdd {
+            id: 11,
+            ..Default::default()
+        };
+        let mut global = State::default();
+        global.images.insert(
+            (device, image),
+            Image {
+                description,
+                published: Some(Published {
+                    fd: Arc::new(fd),
+                    description,
+                }),
+            },
+        );
+        global.views.insert((device, left), (image, 0));
+        global.views.insert((device, right), (image, 1));
+        let memory = vk::DeviceMemory::from_raw(memory);
+        let buffer = vk::Buffer::from_raw(buffer);
+        global.buffers.insert((device, buffer), (memory, 64));
+        global.maps.insert(
+            (device, memory),
+            Mapped {
+                pointer: block.as_mut_ptr() as usize - 64,
+                offset: 0,
+                size: 64 + (block.len() * 4) as u64,
+            },
+        );
+        let pipeline = vk::Pipeline::from_raw(pipeline);
+        global.pipelines.insert(
+            (device, pipeline),
+            PipelineInfo {
+                stages: [1, 2],
+                scene: scene.then_some((2, 9)),
+            },
+        );
+        let set = global.sets.entry((device, descriptor)).or_default();
+        set.buffers.insert(
+            (2, 0),
+            BufferUse {
+                buffer,
+                offset: 0,
+                range: (block.len() * 4) as u64,
+                kind: vk::DescriptorType::UNIFORM_BUFFER,
+            },
+        );
+        let record = global.recordings.entry((device, cmd)).or_default();
+        record.area = Some(vk::Rect2D {
+            extent: vk::Extent2D {
+                width: 4320,
+                height: 2160,
+            },
+            ..Default::default()
+        });
+        record.graphics[0] = descriptor;
+        record.bound.push(descriptor);
+        record.pipeline = pipeline;
+        for (x, view) in [(0.0, left), (2160.0, right)] {
+            global.recordings.get_mut(&(device, cmd)).unwrap().viewport = Some(vk::Viewport {
+                x,
+                width: 2160.0,
+                y: 2160.0,
+                height: -2160.0,
+                ..Default::default()
+            });
+            global
+                .sets
+                .get_mut(&(device, descriptor))
+                .unwrap()
+                .bindings
+                .insert(
+                    // The third submission slot, as a following binding.
+                    (11, 0),
+                    ViewUse {
+                        view,
+                        layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    },
+                );
+            global.draw(device, cmd);
+        }
+        global.submit(device, [cmd].into_iter());
+        global
+    }
+
+    fn block_with(bounds: [[f32; 4]; 2]) -> Vec<u32> {
+        let mut block = vec![0_u32; 704];
+        for (eye, bounds) in bounds.iter().enumerate() {
+            let at = (spirv::bounds_offset(2, eye) / 4) as usize;
+            for (index, value) in [1, 5, 9, 13].into_iter().zip(bounds) {
+                block[at + index] = value.to_bits();
+            }
+        }
+        block
+    }
+
+    #[test]
+    fn scene_draws_report_each_eyes_texture_bounds() {
+        let crop = [0.0, 0.0, 0.867, 1.0];
+        let flip = [0.0, 1.0, 1.0, 0.0];
+        let mut block = block_with([crop, flip]);
+        let frame = scene(&mut block, true).frame.unwrap();
+        assert_eq!(frame.touched_ids[0], 11);
+        assert_eq!(frame.touched_eyes[0].layers, [0, 1]);
+        assert_eq!(frame.touched_bounds[0].get(0), Some(crop));
+        assert_eq!(frame.touched_bounds[0].get(1), Some(flip));
+
+        // An unrecognised pipeline leaves the mapping unknown.
+        let frame = scene(&mut block, false).frame.unwrap();
+        assert_eq!(frame.touched_bounds[0], EyeBounds::default());
+
+        // Implausible values are not reported.
+        let mut block = block_with([[f32::NAN, 0.0, 1.0, 1.0], [0.5, 0.5, 0.5, 1.0]]);
+        let frame = scene(&mut block, true).frame.unwrap();
+        assert_eq!(frame.touched_bounds[0], EyeBounds::default());
     }
 }

@@ -6,9 +6,10 @@ layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 outputColor;
 layout(set = 0, binding = 0) uniform sampler2D source;
 layout(push_constant) uniform Parameters {
-    vec4 crop;     // source uv offset (xy) and size (zw)
+    vec4 crop;     // source uv origin (xy) and signed size (zw); negative flips
     vec4 mask;     // temple width, nasal width, height, feather
     vec4 style;    // shape (0 ellipse, 1 rectangle), strength, eye (0 left, 1 right), encode sRGB
+    vec4 limits;   // lowest and highest texel centres of the eye's rectangle
     float probeStep; // 0 for the overlay, 1 / cell width for fingerprints
 } p;
 
@@ -28,7 +29,9 @@ void main() {
     // Stagger the samples within their cells so thin features moving along
     // either axis cross more than 16 distinct sample coordinates per eye.
     vec2 probeOffset = (vec2(uv.y, 1.0 - uv.x) - 0.5) * p.probeStep;
-    vec2 at = p.crop.xy + (uv + probeOffset) * p.crop.zw;
+    // Stay on the eye's own texels: a packed image's other eye or padding
+    // must never filter into this one.
+    vec2 at = clamp(p.crop.xy + (uv + probeOffset) * p.crop.zw, p.limits.xy, p.limits.zw);
     vec3 color = texture(source, at).rgb;
     if (p.style.w > 0.5) color = encodeSrgb(color);
     outputColor = vec4(color, mix(1.0, visible, clamp(p.style.y, 0.0, 1.0)));

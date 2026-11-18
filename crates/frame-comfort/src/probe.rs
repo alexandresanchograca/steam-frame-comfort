@@ -189,7 +189,9 @@ fn open_source(
         }
         thread::sleep(INTERVAL);
     };
-    Game::with_source(context, false, client, options.source_format)
+    let mut game = Game::with_source(context, false, client, options.source_format)?;
+    game.set_compositor_bounds(!options.ignore_compositor_bounds);
+    Ok(game)
 }
 
 fn source(options: &Options, seconds: Duration, stop: &AtomicBool) -> Result<()> {

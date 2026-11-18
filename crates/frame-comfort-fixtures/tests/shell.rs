@@ -170,6 +170,36 @@ fn game_shows_each_eye_and_lines_only_with_grid_over_ring() -> Result<()> {
 
 #[test]
 #[ignore = "requires a Vulkan device"]
+fn a_capture_of_part_of_the_display_leaves_the_rest_to_the_gap() -> Result<()> {
+    // A game field covering only the right half of each display eye: the
+    // snapshot holds that part and the shell fills the rest with the gap.
+    let context = context()?;
+    let snapshot = snapshot(&context)?;
+    let part = Projection::default().restrict([0.5, 0.0, 1.0, 1.0]);
+    let eyes = [(Pose::default(), part); 2];
+    let face = render(
+        &context,
+        ShellParams {
+            captures: Some(
+                [Capture {
+                    snapshot: &snapshot,
+                    eyes,
+                }; 2],
+            ),
+            ..base()
+        },
+    )?;
+    // GAP is left of straight ahead; its mirror image is right of it.
+    let right = (SIZE - 1 - GAP.0, GAP.1);
+    for eye in 0..2 {
+        assert_rgb(face.pixel(eye, GAP), [0; 3]);
+        assert_rgb(face.pixel(eye, right), picture(eye));
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a Vulkan device"]
 fn refresh_blink_dips_to_black_and_keeps_grid_over_ring_lines() -> Result<()> {
     let context = context()?;
     let snapshot = snapshot(&context)?;

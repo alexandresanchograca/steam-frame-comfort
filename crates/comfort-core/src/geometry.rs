@@ -384,6 +384,19 @@ impl Projection {
         [self.right - self.left, self.bottom - self.top]
     }
 
+    /// The part of this projection covering `field`, given as `[x0, y0, x1,
+    /// y1]` fractions of its width and height from the top-left.
+    pub fn restrict(self, field: [f32; 4]) -> Self {
+        let [x0, y0, x1, y1] = field.map(f64::from);
+        let [width, height] = self.span();
+        Self {
+            left: self.left + width * x0,
+            right: self.left + width * x1,
+            top: self.top + height * y0,
+            bottom: self.top + height * y1,
+        }
+    }
+
     pub fn project(self, world_from_eye: Pose, world_point: Vec3) -> Option<[f64; 2]> {
         if !self.valid() || !world_from_eye.valid() || !world_point.finite() {
             return None;
@@ -733,6 +746,17 @@ mod regression_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_restricted_projection_keeps_the_same_tangents_for_the_same_pixels() {
+        let eye = Projection::from_openvr_raw(-1.665, 1.213, -1.727, 1.172);
+        assert_eq!(eye.restrict([0.0, 0.0, 1.0, 1.0]), eye);
+        let part = eye.restrict([0.25, 0.5, 0.75, 1.0]);
+        assert!((part.left - (-1.665 + 0.25 * 2.878)).abs() < 1e-9);
+        assert!((part.right - (-1.665 + 0.75 * 2.878)).abs() < 1e-9);
+        assert!((part.top - (-1.172 + 0.5 * 2.899)).abs() < 1e-9);
+        assert!((part.bottom - 1.727).abs() < 1e-9);
+    }
 
     #[test]
     fn openvr_vertical_bounds_and_front_shell_match() {

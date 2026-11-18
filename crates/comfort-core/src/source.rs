@@ -1,5 +1,6 @@
 //! Scene selection from Vulkan observer reports, without GPU calls.
 use crate::stereo::{Layout, Packing};
+pub use comfort_protocol::EyeBounds;
 use comfort_protocol::{EyeUse, ImageAdd, MAX_IMAGES};
 use std::collections::BTreeMap;
 
@@ -14,6 +15,8 @@ pub struct Candidate {
     pub layout: u32,
     pub acquired: bool,
     pub eye: EyeUse,
+    /// The compositor's texture bounds for each labelled eye, when known.
+    pub bounds: EyeBounds,
     pub revision: u64,
 }
 
@@ -34,8 +37,10 @@ impl Candidate {
         Eye {
             id: self.image.id,
             layout: self.layout,
-            crop: [0.0, 0.0, 1.0, 1.0],
+            crop: FULL,
             layer: 0,
+            flip: [false; 2],
+            field: FULL_FIELD,
         }
     }
 }
@@ -62,12 +67,77 @@ impl Default for Policy<'_> {
     }
 }
 
+const FULL: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+/// The whole display eye, as `[x0, y0, x1, y1]` fractions of its field.
+pub const FULL_FIELD: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
+/// One eye's picture in a source image and the part of the display eye it
+/// covers. Rows and columns are normalised texture coordinates, top-left
+/// first, and the display field runs left to right and top to bottom.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Eye {
     pub id: u64,
     pub layout: u32,
+    /// Source rectangle `[x, y, width, height]`, positive size.
     pub crop: [f32; 4],
     pub layer: u32,
+    /// Whether the rectangle's columns (x) or rows (y) run against the
+    /// display's: an OpenGL image is stored bottom row first.
+    pub flip: [bool; 2],
+    /// The part of the display eye that the rectangle fills.
+    pub field: [f32; 4],
+}
+
+impl Eye {
+    /// Map this eye as the compositor does: display coordinate `d` in the
+    /// eye's field shows source coordinate `bounds.xy + (bounds.zw - bounds.xy) * d`,
+    /// as OpenVR `VRTextureBounds_t`. A reversed axis flips the picture.
+    /// Bounds outside the texture leave part of the display without picture.
+    pub fn with_bounds(self, bounds: [f32; 4]) -> Option<Self> {
+        if !bounds.iter().all(|value| value.is_finite()) {
+            return None;
+        }
+        let mut crop = [0.0; 4];
+        let mut field = [0.0; 4];
+        let mut flip = [false; 2];
+        for axis in 0..2 {
+            let start = f64::from(bounds[axis]);
+            let span = f64::from(bounds[axis + 2]) - start;
+            if span.abs() < 1e-4 {
+                return None;
+            }
+            // Display coordinates where the source coordinate is 0 and 1.
+            let [a, b] = [-start / span, (1.0 - start) / span];
+            let low = a.min(b).max(0.0);
+            let high = a.max(b).min(1.0);
+            if high - low < 0.01 {
+                return None;
+            }
+            let [s0, s1] = [start + span * low, start + span * high];
+            crop[axis] = s0.min(s1).clamp(0.0, 1.0) as f32;
+            crop[axis + 2] = ((s1 - s0).abs() as f32).min(1.0 - crop[axis]);
+            field[axis] = low as f32;
+            field[axis + 2] = high as f32;
+            flip[axis] = span < 0.0;
+        }
+        Some(Self {
+            crop,
+            flip,
+            field,
+            ..self
+        })
+    }
+
+    /// The source coordinate shown at display coordinate `display`, which
+    /// must lie in this eye's field.
+    pub fn source_at(&self, display: [f32; 2]) -> [f32; 2] {
+        std::array::from_fn(|axis| {
+            let [low, high] = [self.field[axis], self.field[axis + 2]];
+            let along = (display[axis] - low) / (high - low);
+            let along = if self.flip[axis] { 1.0 - along } else { along };
+            self.crop[axis] + along * self.crop[axis + 2]
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,6 +185,7 @@ pub struct Selection {
     pub images: Vec<Eye>,
     pub stream: bool,
     labels: Vec<EyeUse>,
+    bounds: Vec<EyeBounds>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -233,6 +304,10 @@ pub fn select(frame: &[Candidate], policy: Policy<'_>) -> Result<Selection, Reas
         },
         images: candidates.iter().copied().map(Candidate::eye).collect(),
         labels: candidates.iter().map(|candidate| candidate.eye).collect(),
+        bounds: candidates
+            .iter()
+            .map(|candidate| candidate.bounds)
+            .collect(),
         stream,
     })
 }
@@ -246,17 +321,28 @@ impl Selection {
         let mut left = BTreeMap::new();
         let mut right = BTreeMap::new();
         let mut layered = Vec::new();
-        for (&image, &label) in self.images.iter().zip(&self.labels) {
+        let layers = self.generation.layers;
+        for ((&image, &label), bounds) in self.images.iter().zip(&self.labels).zip(&self.bounds) {
+            // The layer the compositor sampled for this eye, mapped with its
+            // texture bounds when they were read. Unusable bounds keep the
+            // whole image, as before bounds were reported.
+            let eye = |eye: usize| {
+                let image = Eye {
+                    layer: label.layers[eye],
+                    ..image
+                };
+                bounds
+                    .get(eye)
+                    .and_then(|bounds| image.with_bounds(bounds))
+                    .unwrap_or(image)
+            };
             match label.eyes {
-                1 if left.insert(label.slot, image).is_none() => {}
-                2 if right.insert(label.slot, image).is_none() => {}
+                1 if label.layers[0] < layers && left.insert(label.slot, eye(0)).is_none() => {}
+                2 if label.layers[1] < layers && right.insert(label.slot, eye(1)).is_none() => {}
                 3 if label.layers[0] != label.layers[1]
-                    && label
-                        .layers
-                        .into_iter()
-                        .all(|layer| layer < self.generation.layers) =>
+                    && label.layers.into_iter().all(|layer| layer < layers) =>
                 {
-                    layered.push(label.layers.map(|layer| Eye { layer, ..image }));
+                    layered.push([eye(0), eye(1)]);
                 }
                 _ => return None,
             }
@@ -476,6 +562,7 @@ mod tests {
                 slot,
                 layers: [0, 0],
             },
+            bounds: EyeBounds::default(),
             revision: 1,
         }
     }
@@ -539,6 +626,110 @@ mod tests {
             select(&[overlay], Policy::default()),
             Err(Reason::NoSource)
         ));
+    }
+
+    fn eye() -> Eye {
+        candidate(1, 3, 9).eye()
+    }
+
+    #[track_caller]
+    fn assert_close(actual: [f32; 4], expected: [f32; 4]) {
+        for (a, e) in actual.iter().zip(expected) {
+            assert!((a - e).abs() < 1e-5, "{actual:?} vs {expected:?}");
+        }
+    }
+
+    #[test]
+    fn identity_bounds_keep_the_whole_upright_image() {
+        let mapped = eye().with_bounds([0.0, 0.0, 1.0, 1.0]).unwrap();
+        assert_eq!(mapped, eye());
+    }
+
+    #[test]
+    fn symmetric_game_fields_crop_each_eye_like_the_compositor() {
+        // Asgard's Wrath 2, measured on the Frame: each eye renders a
+        // horizontally symmetric field and the compositor shows only the
+        // part inside the headset's asymmetric eye.
+        let left = eye().with_bounds([0.0, 0.0, 0.867_11, 1.0]).unwrap();
+        assert_close(left.crop, [0.0, 0.0, 0.867_11, 1.0]);
+        assert_eq!(left.flip, [false; 2]);
+        assert_eq!(left.field, FULL_FIELD);
+        let right = eye().with_bounds([0.134_15, 0.0, 1.0, 1.0]).unwrap();
+        assert_close(right.crop, [0.134_15, 0.0, 0.865_85, 1.0]);
+        // The display's left edge shows the cropped source's left edge.
+        assert_eq!(right.source_at([0.0, 0.5]), [0.134_15, 0.5]);
+    }
+
+    #[test]
+    fn reversed_rows_flip_an_opengl_image_but_keep_its_columns() {
+        // Vader Immortal renders through OpenGL ES, bottom row first.
+        let mapped = eye().with_bounds([0.0, 1.0, 1.0, 0.0]).unwrap();
+        assert_eq!(mapped.crop, FULL);
+        assert_eq!(mapped.flip, [false, true]);
+        assert_eq!(mapped.source_at([0.25, 0.0]), [0.25, 1.0]);
+        assert_eq!(mapped.source_at([0.25, 1.0]), [0.25, 0.0]);
+        // A 180° rotation reverses both axes.
+        let rotated = eye().with_bounds([1.0, 1.0, 0.0, 0.0]).unwrap();
+        assert_eq!(rotated.flip, [true, true]);
+    }
+
+    #[test]
+    fn a_narrower_game_field_covers_only_part_of_the_display() {
+        // Source coordinates -0.25..1.25 across the display: the image fills
+        // the middle two thirds of the display eye's width.
+        let mapped = eye().with_bounds([-0.25, 0.0, 1.25, 1.0]).unwrap();
+        assert_close(mapped.crop, FULL);
+        assert_close(mapped.field, [1.0 / 6.0, 0.0, 5.0 / 6.0, 1.0]);
+        for x in [0.2_f32, 0.5, 0.8] {
+            let expected = -0.25 + 1.5 * x;
+            assert!((mapped.source_at([x, 0.5])[0] - expected).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn bounds_without_a_usable_overlap_are_rejected() {
+        assert_eq!(eye().with_bounds([1.5, 0.0, 2.5, 1.0]), None);
+        assert_eq!(eye().with_bounds([0.5, 0.0, 0.5, 1.0]), None);
+        assert_eq!(eye().with_bounds([f32::NAN, 0.0, 1.0, 1.0]), None);
+    }
+
+    #[test]
+    fn labelled_eyes_take_their_layer_and_bounds() {
+        let mut array = candidate(5, 3, 9);
+        array.image.array_layers = 2;
+        array.eye.layers = [0, 1];
+        array.bounds.set(0, [0.0, 0.0, 0.867, 1.0]);
+        array.bounds.set(1, [0.0, 1.0, 1.0, 0.0]);
+        let mut sibling = array;
+        sibling.image.id = 6;
+        let stereo = select(&[array, sibling], Policy::default())
+            .unwrap()
+            .from_labels()
+            .unwrap();
+        assert_eq!(stereo.rule, Rule::LocalArray);
+        let [left, right] = stereo.slots[0];
+        assert_eq!((left.layer, right.layer), (0, 1));
+        assert_close(left.crop, [0.0, 0.0, 0.867, 1.0]);
+        assert_eq!(right.flip, [false, true]);
+
+        // A single-eye label reports the layer it sampled.
+        let mut frame = [candidate(1, 1, 1), candidate(2, 2, 1)];
+        for candidate in &mut frame {
+            candidate.image.array_layers = 2;
+        }
+        frame[1].eye.layers = [0, 1];
+        let stereo = select(&frame, Policy::default())
+            .unwrap()
+            .from_labels()
+            .unwrap();
+        assert_eq!(stereo.slots[0].map(|eye| eye.layer), [0, 1]);
+        frame[1].eye.layers = [0, 2];
+        assert!(
+            select(&frame, Policy::default())
+                .unwrap()
+                .from_labels()
+                .is_none()
+        );
     }
 
     #[test]

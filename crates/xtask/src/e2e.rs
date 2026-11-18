@@ -119,6 +119,8 @@ pub fn e2e(filters: &[String]) -> io::Result<()> {
             "shell",
             "--test",
             "imported_source",
+            "--test",
+            "mapping",
         ],
         true,
     )?;

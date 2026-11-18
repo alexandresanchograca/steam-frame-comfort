@@ -64,6 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 layout: ash::vk::ImageLayout::from_raw(layout as i32),
                 layer: 0,
                 crop: [0.0, 0.0, 1.0, 1.0],
+                flip: [false; 2],
                 external: true,
             };
             // SAFETY: The fixture reports a completed release to the external

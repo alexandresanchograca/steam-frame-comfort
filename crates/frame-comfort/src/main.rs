@@ -133,6 +133,11 @@ struct Options {
     /// Verify the synthetic frame code and eye colors in each accepted snapshot.
     #[arg(long)]
     check_frame_code: bool,
+    /// Sample each labelled eye's whole image instead of the compositor's
+    /// texture bounds, as builds before bounds were reported did. For
+    /// same-session comparisons.
+    #[arg(long)]
+    ignore_compositor_bounds: bool,
     /// Report input without opening an overlay.
     #[arg(long, group = "probe")]
     probe_input: bool,

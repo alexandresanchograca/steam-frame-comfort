@@ -461,6 +461,154 @@ pub fn linear_p010_source(
     }
 }
 
+/// A device-local RGBA8 source as the observer would import it, with one
+/// row-major texel list per array layer, in shader-read layout. Row 0 is the
+/// top row as Vulkan samples it, so an OpenGL producer's picture is passed
+/// bottom row first.
+pub fn uploaded_source(
+    context: &Arc<Context>,
+    width: u32,
+    height: u32,
+    layers: &[Vec<[u8; 4]>],
+) -> Result<Arc<ImportedImage>> {
+    let texels = (width as usize) * (height as usize);
+    if texels == 0 || layers.is_empty() || layers.iter().any(|layer| layer.len() != texels) {
+        return Err(io::Error::other("source layers differ from the extent").into());
+    }
+    let device = &context.device;
+    let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST;
+    let bytes: Vec<u8> = layers.iter().flatten().flatten().copied().collect();
+    let mut staging = Buffer::new(context, bytes.len(), vk::BufferUsageFlags::TRANSFER_SRC)?;
+    staging.write(&bytes)?;
+    // SAFETY: The image and memory are owned here until wrapped below, and
+    // freed on every early return. The upload is fenced before returning.
+    unsafe {
+        let image = device.create_image(
+            &vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(RGBA)
+                .extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(layers.len() as u32)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .usage(usage),
+            None,
+        )?;
+        let requirements = device.get_image_memory_requirements(image);
+        let Some(memory_type) = context.memory_type(
+            requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        ) else {
+            device.destroy_image(image, None);
+            return Err(io::Error::other("no local source image memory").into());
+        };
+        let memory = match device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(requirements.size)
+                .memory_type_index(memory_type),
+            None,
+        ) {
+            Ok(memory) => memory,
+            Err(error) => {
+                device.destroy_image(image, None);
+                return Err(error.into());
+            }
+        };
+        let source = Arc::new(ImportedImage::owned(
+            Arc::clone(context),
+            image,
+            memory,
+            ImageAdd {
+                format: RGBA.as_raw() as u32,
+                width,
+                height,
+                mip_levels: 1,
+                array_layers: layers.len() as u32,
+                samples: vk::SampleCountFlags::TYPE_1.as_raw(),
+                usage: usage.as_raw(),
+                ..ImageAdd::default()
+            },
+        ));
+        device.bind_image_memory(image, memory, 0)?;
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(COLOR)
+            .level_count(1)
+            .layer_count(layers.len() as u32);
+        let barrier = |old, new, from, to| {
+            vk::ImageMemoryBarrier::default()
+                .image(image)
+                .subresource_range(range)
+                .old_layout(old)
+                .new_layout(new)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .src_access_mask(from)
+                .dst_access_mask(to)
+        };
+        let mut commands = Commands::new(context)?;
+        commands.begin()?;
+        device.cmd_pipeline_barrier(
+            commands.handle,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier(
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_WRITE,
+            )],
+        );
+        let regions: Vec<_> = (0..layers.len())
+            .map(|layer| {
+                vk::BufferImageCopy::default()
+                    .buffer_offset((layer * texels * 4) as u64)
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(COLOR)
+                            .base_array_layer(layer as u32)
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D {
+                        width,
+                        height,
+                        depth: 1,
+                    })
+            })
+            .collect();
+        device.cmd_copy_buffer_to_image(
+            commands.handle,
+            staging.handle,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &regions,
+        );
+        device.cmd_pipeline_barrier(
+            commands.handle,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier(
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+            )],
+        );
+        commands.submit()?;
+        commands.wait()?;
+        Ok(source)
+    }
+}
+
 pub fn painted_snapshot(
     context: &Arc<Context>,
     eye_size: u32,
