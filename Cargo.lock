@@ -211,7 +211,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "comfort-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "comfort-protocol",
  "serde_json",
@@ -219,14 +219,14 @@ dependencies = [
 
 [[package]]
 name = "comfort-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
 ]
 
 [[package]]
 name = "comfort-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ash",
  "bindgen",
@@ -242,7 +242,7 @@ dependencies = [
 
 [[package]]
 name = "comfort-source-layer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ash",
  "bytemuck",
@@ -382,7 +382,7 @@ checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
 name = "frame-comfort"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ash",
  "clap",
@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "frame-comfort-fixtures"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ash",
  "comfort-core",
@@ -409,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "frame-comfortctl"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "comfort-core",
@@ -1004,7 +1004,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ed25519-dalek",
  "serde_json",

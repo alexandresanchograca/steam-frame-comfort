@@ -40,10 +40,10 @@ C linker, libclang and `glslc`:
 
 ```sh
 cargo build --locked --release -p frame-comfort -p comfort-source-layer -p frame-comfortctl
-cargo xtask package target/release dist/frame-comfort-0.1.0
+cargo xtask package target/release dist/frame-comfort-0.2.0
 ```
 
-`dist/frame-comfort-0.1.0` is the same folder a release contains. To
+`dist/frame-comfort-0.2.0` is the same folder a release contains. To
 publish a signed release that installed copies can update to, see
 `cargo xtask release` and [release.json](release.json).
 
