@@ -9,7 +9,7 @@ periphery holds still, fixed to your real room. Your eyes keep a stable
 reference while the game moves. Release the stick and normal VR fades back.
 
 <p align="center">
-  <img src="media/locomotion-gif.gif" width="335"
+  <img src="media/locomotion-demo.gif" width="500"
        alt="Walking in a VR game with Frame Comfort: the centre of the view stays live while the periphery holds still">
   <br>
   <em>Moving with the thumbstick: the centre stays live, the periphery holds still.</em>
@@ -51,6 +51,15 @@ Tests: `cargo test --locked --workspace`, plus `cargo xtask e2e` for the
 Vulkan and fake-SteamVR suite.
 
 ## Install
+
+<p align="center">
+  <a href="https://youtu.be/l1NEhpLP2DM">
+    <img src="https://img.youtube.com/vi/l1NEhpLP2DM/hqdefault.jpg" width="480"
+         alt="Video: installing and using Frame Comfort on the Steam Frame">
+  </a>
+  <br>
+  <em><a href="https://youtu.be/l1NEhpLP2DM">Watch the install and demo video on YouTube</a></em>
+</p>
 
 1. On the Frame in Desktop Mode, download the latest
    `frame-comfort-VERSION-linux-aarch64.tar.gz` from **Releases** and extract
